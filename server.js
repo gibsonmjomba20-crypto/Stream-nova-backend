@@ -1,169 +1,178 @@
-import 'dotenv/config';
 import express from 'express';
 import axios from 'axios';
 import cors from 'cors';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
-import * as cheerio from 'cheerio';
 
 const app = express();
+const http = axios.create({ timeout: 8000, maxRedirects: 3 });
+const tmdbKey = process.env.TMDB_API || process.env.TMBD;
+const hlsAllowedHosts = new Set(
+  (process.env.HLS_ALLOWED_HOSTS || '')
+    .split(',')
+    .map((host) => host.trim().toLowerCase())
+    .filter(Boolean),
+);
+
 app.set('trust proxy', 1);
-
-app.use(helmet({ crossOriginResourcePolicy: false, contentSecurityPolicy: false }));
+app.use(helmet({ crossOriginResourcePolicy: false }));
 app.use(cors({ origin: '*' }));
-app.use(express.json());
-app.use('/api/', rateLimit({ windowMs: 15 * 60 * 1000, max: 300 }));
+app.use(express.json({ limit: '32kb' }));
+app.use('/api/', rateLimit({ windowMs: 15 * 60 * 1000, limit: 120 }));
 
-const TMDB_API = process.env.TMDB_API || '89f2639942a0749f947521e02248fb7c';
+function sendError(res, status, message) {
+  return res.status(status).json({ success: false, error: message });
+}
 
-// Browser headers to bypass Cloudflare
-const BROWSER_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-    'Accept-Language': 'en-US,en;q=0.5',
-    'Connection': 'keep-alive',
-    'Upgrade-Insecure-Requests': '1'
-};
+function parsePositiveInteger(value, fallback, maximum) {
+  const parsed = Number.parseInt(String(value ?? ''), 10);
+  return Number.isInteger(parsed) && parsed > 0 ? Math.min(parsed, maximum) : fallback;
+}
 
-// 1. TMDB Discover
+app.get('/', (_req, res) => res.json({ status: 'online' }));
+
 app.get('/api/v1/discover', async (req, res) => {
-    try {
-        const { type = 'movie', category = 'trending', page = 1, country, genre, startYear = 1994, endYear = 2030 } = req.query;
-        let url = `https://api.themoviedb.org/3/discover/${type}?api_key=${TMDB_API}&page=${page}`;
-        if (category === 'trending') { url += `&sort_by=vote_count.desc`; } else { url += `&sort_by=popularity.desc`; }
-        
-        const dateField = type === 'movie' ? 'primary_release_date' : 'first_air_date';
-        url += `&${dateField}.gte=${startYear}-01-01&${dateField}.lte=${endYear}-12-31`;
-        
-        if (category === 'anime') url += `&with_genres=16&with_original_language=ja`;
-        if (country && country !== 'all') url += `&with_origin_country=${country}`;
-        if (genre && genre !== 'all') url += `&with_genres=${genre}`;
+  if (!tmdbKey) return sendError(res, 503, 'TMDB_API is not configured.');
 
-        const response = await axios.get(url, { timeout: 8000 });
-        res.json({ success: true, page: parseInt(page), results: response.data.results });
-    } catch (error) { 
-        res.status(500).json({ success: false, error: "TMDB unavailable" }); 
-    }
+  const type = req.query.type === 'tv' ? 'tv' : 'movie';
+  const page = parsePositiveInteger(req.query.page, 1, 500);
+  const params = {
+    api_key: tmdbKey,
+    page,
+    sort_by: 'popularity.desc',
+  };
+
+  if (typeof req.query.genre === 'string' && /^\d+(,\d+)*$/.test(req.query.genre)) {
+    params.with_genres = req.query.genre;
+  }
+  if (typeof req.query.country === 'string' && /^[A-Z]{2}$/.test(req.query.country)) {
+    params.with_origin_country = req.query.country;
+  }
+  if (req.query.category === 'anime') {
+    params.with_genres = '16';
+    params.with_original_language = 'ja';
+  }
+
+  try {
+    const { data } = await http.get(`https://api.themoviedb.org/3/discover/${type}`, { params });
+    return res.json({ success: true, page: data.page, results: data.results ?? [] });
+  } catch (error) {
+    const status = error.response?.status === 401 ? 502 : 502;
+    return sendError(res, status, 'TMDB could not complete the request.');
+  }
 });
 
-// 2. Player Sources (Robust Scraper)
-app.get('/api/v1/player/:id/sources', async (req, res) => {
-    const { id } = req.params;
-    const { type = 'movie', season = 1, episode = 1 } = req.query;
-    const sources = [];
+app.get(['/api/v1/anime', '/api/v1/anime/extract'], async (req, res) => {
+  if (!tmdbKey) return sendError(res, 503, 'TMDB_API is not configured.');
 
-    // Try VidLink API first
-    try {
-        const url = type === 'movie' 
-            ? `https://vidlink.pro/api/b/movie/${id}`
-            : `https://vidlink.pro/api/b/tv/${id}/${season}/${episode}`;
-        
-        const { data } = await axios.get(url, { timeout: 6000, headers: BROWSER_HEADERS });
-        
-        if (data?.stream?.playlist) {
-            sources.push({
-                provider: 'VidLink',
-                url: data.stream.playlist,
-                type: 'hls',
-                referer: 'https://vidlink.pro/'
-            });
-        }
-    } catch (e) { 
-        console.log("VidLink failed, trying VidSrc fallback..."); 
-    }
-
-    // Fallback: Direct Scrape of VidSrc
-    if (sources.length === 0) {
-        try {
-            const url = type === 'movie'
-                ? `https://vidsrc.xyz/embed/movie/${id}`
-                : `https://vidsrc.xyz/embed/tv/${id}/${season}/${episode}`;
-            
-            const { data } = await axios.get(url, { headers: BROWSER_HEADERS, timeout: 6000 });
-            
-            // Look for the m3u8 link in the HTML source
-            const match = data.match(/src:\s*'([^']*\.m3u8)'/);
-            if (match) {
-                sources.push({
-                    provider: 'VidSrc',
-                    url: match[1],
-                    type: 'hls',
-                    referer: 'https://vidsrc.xyz/'
-                });
-            }
-        } catch (err) { 
-            console.log("VidSrc failed too."); 
-        }
-    }
-
-    if (sources.length > 0) {
-        res.json({ success: true, sources });
-    } else {
-        res.status(404).json({ success: false, error: "No streams found." });
-    }
+  const page = parsePositiveInteger(req.query.page, 1, 500);
+  const title = typeof req.query.title === 'string' ? req.query.title.trim().slice(0, 120) : '';
+  const endpoint = title
+    ? 'https://api.themoviedb.org/3/search/tv'
+    : 'https://api.themoviedb.org/3/discover/tv';
+  try {
+    const { data } = await http.get(endpoint, {
+      params: {
+        api_key: tmdbKey,
+        page,
+        ...(title ? { query: title } : { sort_by: 'popularity.desc' }),
+        with_genres: '16',
+        with_original_language: 'ja',
+      },
+    });
+    return res.json({ success: true, page: data.page, results: data.results ?? [] });
+  } catch {
+    return sendError(res, 502, 'Anime catalog is temporarily unavailable.');
+  }
 });
 
-// 3. Anime
-app.get('/api/v1/anime/extract', async (req, res) => {
-    const { title, episode = 1, dub = 'true' } = req.query;
-    if (!title) return res.status(400).json({ error: "Title required" });
-    
-    try {
-        const API = "https://hianime-api-iy4s.onrender.com/api";
-        const search = await axios.get(`${API}/search`, { params: { keyword: title, page: 1 }, timeout: 9000 });
-        if (!search.data?.animes?.length) return res.status(404).json({ success: false, error: "Anime not found" });
-        
-        const epList = await axios.get(`${API}/episodes/${search.data.animes[0].id}`, { timeout: 9000 });
-        const targetEp = epList.data.episodes.find(e => e.number === parseInt(episode)) || epList.data.episodes[0];
-        
-        const servers = await axios.get(`${API}/servers`, { params: { id: targetEp.id }, timeout: 9000 });
-        const serverList = (dub === 'true' && servers.data.dub?.length > 0) ? servers.data.dub : servers.data.sub;
-        
-        const stream = await axios.get(`${API}/stream`, { params: { id: targetEp.id, type: dub === 'true' ? 'dub' : 'sub', server: serverList[0].name }, timeout: 9000 });
-        const source = stream.data.sources.find(s => s.isM3U8) || stream.data.sources[0];
+app.get('/api/v1/player/:id/sources', (_req, res) =>
+  sendError(res, 501, 'Stream extraction from third-party sites is not supported. Connect an authorized media provider instead.'),
+);
 
-        res.json({ 
-            success: true, 
-            provider: `HiAnime`, 
-            title: search.data.animes[0].title, 
-            streamUrl: source.url, 
-            headers: source.headers || { "Referer": "https://hianime.to/" }, 
-            type: 'hls' 
-        });
-    } catch (error) { 
-        res.status(500).json({ success: false, error: "Anime API timed out." }); 
-    }
-});
-
-// 4. Proxy Route
 app.get('/api/v1/proxy', async (req, res) => {
-    const { url, referer } = req.query;
-    if (!url) return res.status(400).send('URL required');
+  const rawUrl = req.query.url;
+  if (typeof rawUrl !== 'string') return sendError(res, 400, 'A playlist URL is required.');
 
+  let target;
+  try {
+    target = new URL(rawUrl);
+  } catch {
+    return sendError(res, 400, 'The playlist URL is invalid.');
+  }
+
+  if (
+    target.protocol !== 'https:' ||
+    !target.pathname.toLowerCase().endsWith('.m3u8') ||
+    !hlsAllowedHosts.has(target.hostname.toLowerCase())
+  ) {
+    return sendError(res, 400, 'Only HTTPS playlists on configured HLS_ALLOWED_HOSTS are permitted.');
+  }
+
+  const referer = req.query.referer;
+  const headers = {};
+  if (typeof referer === 'string') {
     try {
-        const response = await axios({
-            method: 'get', url: url, responseType: 'stream',
-            headers: { ...BROWSER_HEADERS, 'Referer': referer || 'https://vidlink.pro/' }
-        });
-        res.setHeader('Content-Type', response.headers['content-type'] || 'application/vnd.apple.mpegurl');
-        res.setHeader('Access-Control-Allow-Origin', '*');
-        response.data.pipe(res);
-    } catch (error) { res.status(500).send('Proxy Error'); }
+      const parsedReferer = new URL(referer);
+      if (parsedReferer.protocol === 'https:') headers.Referer = parsedReferer.origin;
+    } catch {
+      return sendError(res, 400, 'The referer URL is invalid.');
+    }
+  }
+
+  let upstream;
+  try {
+    upstream = await http.get(target.toString(), {
+      responseType: 'stream',
+      headers,
+      maxContentLength: 5 * 1024 * 1024,
+    });
+
+    res.set({
+      'Access-Control-Allow-Origin': '*',
+      'Cache-Control': 'no-store',
+      'Content-Type': upstream.headers['content-type'] || 'application/vnd.apple.mpegurl',
+      'X-Content-Type-Options': 'nosniff',
+    });
+    upstream.data.on('error', () => {
+      if (!res.headersSent) sendError(res, 502, 'Playlist stream failed.');
+      else res.destroy();
+    });
+    upstream.data.pipe(res);
+    res.on('close', () => upstream.data.destroy());
+  } catch {
+    upstream?.data?.destroy();
+    return sendError(res, 502, 'Playlist provider is temporarily unavailable.');
+  }
 });
 
-// 5. Sports
-app.get('/api/v1/sports', async (req, res) => {
-    try {
-        const espn = await axios.get('https://site.api.espn.com/apis/site/v2/sports/soccer/all/scoreboard', { headers: { 'User-Agent': 'Mozilla/5.0' } });
-        const events = (espn.data.events || []).map(e => {
-            const c = e.competitions?.[0] || {};
-            return { id: e.id, name: e.name, date: e.date, status: c.status?.type?.description || 'Scheduled', isLive: c.status?.type?.description === 'In Progress', homeTeam: c.competitors?.find(x => x.homeAway === 'home')?.team?.displayName, awayTeam: c.competitors?.find(x => x.homeAway === 'away')?.team?.displayName };
-        });
-        res.json({ success: true, events });
-    } catch (e) { res.status(500).json({ success: false, error: "Sports failed" }); }
+app.get('/api/v1/sports', async (_req, res) => {
+  try {
+    const { data } = await http.get(
+      'https://site.api.espn.com/apis/site/v2/sports/soccer/all/scoreboard',
+    );
+    const events = (data.events ?? []).map((event) => {
+      const competition = event.competitions?.[0] ?? {};
+      return {
+        id: event.id,
+        name: event.name,
+        date: event.date,
+        status: competition.status?.type?.description ?? 'Scheduled',
+        isLive: competition.status?.type?.state === 'in',
+        homeTeam: competition.competitors?.find((team) => team.homeAway === 'home')?.team?.displayName ?? null,
+        awayTeam: competition.competitors?.find((team) => team.homeAway === 'away')?.team?.displayName ?? null,
+      };
+    });
+    return res.json({ success: true, events });
+  } catch {
+    return sendError(res, 502, 'Sports scores are temporarily unavailable.');
+  }
 });
 
-// Root route to test
-app.get('/', (req, res) => res.json({ status: "online" }));
+app.use((_req, res) => sendError(res, 404, 'Route not found.'));
+app.use((error, _req, res, _next) => {
+  if (res.headersSent) return res.end();
+  return sendError(res, 500, 'An unexpected server error occurred.');
+});
 
 export default app;
